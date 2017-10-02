@@ -2,6 +2,7 @@
  * California scraper
  * Outputs a CSV file containing all contractors in california + their contact info
  *
+ * TODO: keep track of last license and push new ones
  */
 
 
@@ -12,107 +13,94 @@ const Promise = require('bluebird');
 const fs = require('fs');
 const csvWriter = require('csv-write-stream');
 
-// How many pages we search per letter
-const DEPTH_OF_SEARCH_PER_LETTER = 500;
 
-// TODO: store the list in SQLITE.
-//
+const MODE = 'historical'; // if mode != historical, assumes theres a spreadsheet containing
+                           // the highest license number, reads that number and continues writing.
+const HIGHEST_LICENSE_NUMBER = 1031528;
+const CURRENT_LICENSE_NUMBER = 1025621;
+const LOWEST_LICENSE_NUMBER = 231528;
+
 const writer = csvWriter()
 writer.pipe(fs.createWriteStream('out.csv'))
 
-// TODO: take in a list of valid cities
-// TODO: dont do duplicates of the same license #
-// currentLicenseNum is null on the first call but used on subsequent calls
-// returns a list of contractors with the given name & license number info.
-// This function should be called subsequently.
-function searchForContractorsByName(name, previousContractors) {
-  const encodedName = encodeURIComponent(name);
-  const url = `https://www2.cslb.ca.gov/onlineservices/CheckLicenseII/NameSearch.aspx?NextName=${encodedName}`;
+function scrapePersonnel(license, name) {
+  const encodedName = name;
+  const url = `https://www2.cslb.ca.gov/onlineservices/CheckLicenseII/PersonnelList.aspx?LicNum=${license}&LicName=${name}`;
   return request({method: 'POST', url: url, headers: {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36',
     'Referrer': 'url',
   }}).then((body) => {
     const $ = cheerio.load(body)
-    const contractors = [];
-    let nextName = '';
-    let hasData = false;
-    let count = 0;
-    let repeatPage = false;
-    $("#ctl00_LeftColumnMiddle_Table1 tr td table tbody").each((index, element) => {
-      count++;
-      const contractor = {};
-      $(element).find('td').each((index, element) => {
-        const text = $(element).text().trim();
-        const indices = {
-          '1': 'name',
-          '3': 'type',
-          '5': 'license',
-          '7': 'city',
-          '9': 'status'
-        }
-
-        if (indices[index]) {
-          contractor[indices[index]] = text;
-        }
-      });
-      nextName = contractor.name;
-      if (contractor.status == 'Active') {
-        writer.write(contractor);
-        contractors.push(contractor);
-        hasData = true;
+    // cheerio returns an iterable object which we turn into an array
+    const personnelContent = Array.from($("#ctl00_LeftColumnMiddle_Table1 table tr").children()
+      .map(function(i, e) {
+        return $(this).text()
+      }));
+    const personnel = [];
+    for (let i = 0; i < personnelContent.length; i++) {
+      if (personnelContent[i] == 'Name') {
+        personnel.push(personnelContent[i+1].trim());
       }
-      if (_.findWhere(previousContractors, {license: contractor.license, type: contractor.type, name: contractor.name, city: contractor.city} )) {
-        repeatPage = true;
-      }
-    });
-
-    if (count < 50 || repeatPage) {
-      hasData = false;
-      console.log('out of data, next');
     }
-    return { contractors, nextName, hasData }
+    return personnel.join(',');
+  })
+}
+
+function scrapeLicense(license) {
+  const encoded = `%09${license}`;
+  const url = `https://www2.cslb.ca.gov/onlineservices/CheckLicenseII/LicenseDetail.aspx?LicNum=${encoded}`;
+  return request({method: 'POST', url: url, headers: {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36',
+    'Referrer': 'url',
+  }}).then((body) => {
+    const $ = cheerio.load(body)
+    let businessInfo = $("#ctl00_LeftColumnMiddle_BusInfo").html().split('<br>');
+    if (businessInfo.length == 0) {
+      throw 'invalid page';
+    }
+    let statusInfo = $("#ctl00_LeftColumnMiddle_Status").text();
+    const contractor = {
+      license,
+      status: statusInfo == 'This license is current and active.All information below should be reviewed.' ? 'active' : 'inactive'
+    }
+    debugger;
+    for (let i = 0; i < businessInfo.length; i++) {
+      if (businessInfo[i].indexOf(',') !== -1) {
+        contractor.city = businessInfo[i].split(',')[0]
+        contractor.zip = businessInfo[i].match(/\d+/)[0]
+      }
+      if (businessInfo[i].indexOf(':') !== -1) {
+        contractor.phone = businessInfo[i].split(':')[1]
+      }
+    }
+    contractor.name = businessInfo[0];
+    return scrapePersonnel(license, contractor.name).then((personnel) => {
+      console.log('writing', license);
+      contractor.personnel = personnel;
+      writer.write(contractor);
+      return contractor;
+    });
+  })
+}
+
+function historicalScrape(number) {
+  if (!number) { number = CURRENT_LICENSE_NUMBER; }
+  if (number <= LOWEST_LICENSE_NUMBER) { console.log('done'); return; }
+  return scrapeLicense(number).then((res) => {
+    return Promise.resolve().timeout(1000).then(() => {
+      return historicalScrape(number - 1);
+    })
   }).catch((e) => {
-    console.log('error, going on to the next thing.');
-    return Promise.resolve().timeout(60000).then(() => {
-      return { contractors: [], nextName: null, hasData: false }
-    });
-  })
+    console.log('got an error');
+    return Promise.resolve().timeout(30000).then(() => {
+      return historicalScrape(number - 1);
+    })
+  });
+
+}
+if (MODE == 'historical') {
+  historicalScrape();
+} else {
+
 }
 
-// goes down the rabbit hole of all pages with a given letter
-// (recursive)
-// Stops searching after 10 pages.
-function scrapeContractorPageAndContinue(name, contractorList, count) {
-  if (count > DEPTH_OF_SEARCH_PER_LETTER) {
-    return contractorList;
-  }
-
-  // wait 2 seconds between scrapes.
-  return Promise.resolve().timeout(2000).then(() => {
-    // used for detecting when we're at the end of a cycle
-    let previousContractors = contractorList.length > 50 ? contractorList.slice(contractorList.length-50) : [];
-    return searchForContractorsByName(name, previousContractors);
-  }).then((results) => {
-    console.log('page', count, 'name', name, 'number of contractors', results.contractors.length, 'num total', contractorList.length);
-    if (!results.hasData) {
-      console.log('ran out of data, done this rabbit hole.');
-      return contractorList;
-    }
-    return scrapeContractorPageAndContinue(results.nextName, contractorList.concat(results.contractors), count + 1)
-  })
-}
-
-function scrapeContractorsWithLetter(letter) {
-  return scrapeContractorPageAndContinue(letter, [], 1)
-}
-
-var alphabet = "abcdefghijklmnopqrstuvwxyz0123456789".split("");
-alphabet = "cdefghijklmnopqrstuvwxyz0123456789".split("");
-
-// used to promise.reduce but now dont because id run out of memory
-Promise.each(alphabet, function(letter) {
-  return scrapeContractorsWithLetter(letter, [])
-}).then(() => {
-  console.log('done');
-  writer.end();
-});
