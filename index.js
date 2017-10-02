@@ -37,6 +37,7 @@ function scrapePersonnel(license, name) {
         return $(this).text()
       }));
     const personnel = [];
+    // grab multiple personnel
     for (let i = 0; i < personnelContent.length; i++) {
       if (personnelContent[i] == 'Name') {
         personnel.push(personnelContent[i+1].trim());
